@@ -432,6 +432,32 @@ static void shadow_protect_win(struct s3c_fb_win *win, bool protect)
 }
 
 /**
+ * s3c_fb_enable() - Set the state of the main LCD output
+ * @sfb: The main framebuffer state.
+ * @enable: The state to set.
+ */
+static void s3c_fb_enable(struct s3c_fb *sfb, int enable)
+{
+	u32 vidcon0 = readl(sfb->regs + VIDCON0);
+
+	if (enable)
+		vidcon0 |= VIDCON0_ENVID | VIDCON0_ENVID_F;
+	else {
+		/* see the note in the framebuffer datasheet about
+		 * why you cannot take both of these bits down at the
+		 * same time. */
+
+		if (!(vidcon0 & VIDCON0_ENVID))
+			return;
+
+		vidcon0 |= VIDCON0_ENVID;
+		vidcon0 &= ~VIDCON0_ENVID_F;
+	}
+
+	writel(vidcon0, sfb->regs + VIDCON0);
+}
+
+/**
  * s3c_fb_set_par() - framebuffer request to set new framebuffer state.
  * @info: The framebuffer to change.
  *
@@ -501,8 +527,9 @@ static int s3c_fb_set_par(struct fb_info *info)
 		if (sfb->variant.is_2443)
 			data |= (1 << 5);
 
-		data |= VIDCON0_ENVID | VIDCON0_ENVID_F;
 		writel(data, regs + VIDCON0);
+
+		s3c_fb_enable(sfb, 1);
 
 		data = VIDTCON0_VBPD(var->upper_margin - 1) |
 		       VIDTCON0_VFPD(var->lower_margin - 1) |
@@ -565,6 +592,7 @@ static int s3c_fb_set_par(struct fb_info *info)
 	}
 
 	data = WINCONx_ENWIN;
+	sfb->enabled |= (1 << win->index);
 
 	/* note, since we have to round up the bits-per-pixel, we end up
 	 * relying on the bitfield information for r/g/b/a to work out
@@ -612,7 +640,8 @@ static int s3c_fb_set_par(struct fb_info *info)
 		} else if (var->transp.length == 1)
 			data |= WINCON1_BPPMODE_25BPP_A1888
 				| WINCON1_BLD_PIX;
-		else if (var->transp.length == 4)
+		else if ((var->transp.length == 4) ||
+			(var->transp.length == 8))
 			data |= WINCON1_BPPMODE_28BPP_A4888
 				| WINCON1_BLD_PIX | WINCON1_ALPHA_SEL;
 		else
@@ -750,32 +779,6 @@ static int s3c_fb_setcolreg(unsigned regno,
 }
 
 /**
- * s3c_fb_enable() - Set the state of the main LCD output
- * @sfb: The main framebuffer state.
- * @enable: The state to set.
- */
-static void s3c_fb_enable(struct s3c_fb *sfb, int enable)
-{
-	u32 vidcon0 = readl(sfb->regs + VIDCON0);
-
-	if (enable)
-		vidcon0 |= VIDCON0_ENVID | VIDCON0_ENVID_F;
-	else {
-		/* see the note in the framebuffer datasheet about
-		 * why you cannot take both of these bits down at the
-		 * same time. */
-
-		if (!(vidcon0 & VIDCON0_ENVID))
-			return;
-
-		vidcon0 |= VIDCON0_ENVID;
-		vidcon0 &= ~VIDCON0_ENVID_F;
-	}
-
-	writel(vidcon0, sfb->regs + VIDCON0);
-}
-
-/**
  * s3c_fb_blank() - blank or unblank the given window
  * @blank_mode: The blank state from FB_BLANK_*
  * @info: The framebuffer to blank.
@@ -801,12 +804,16 @@ static int s3c_fb_blank(int blank_mode, struct fb_info *info)
 
 	case FB_BLANK_NORMAL:
 		/* disable the DMA and display 0x0 (black) */
+		shadow_protect_win(win, 1);
 		writel(WINxMAP_MAP | WINxMAP_MAP_COLOUR(0x0),
 		       sfb->regs + sfb->variant.winmap + (index * 4));
+		shadow_protect_win(win, 0);
 		break;
 
 	case FB_BLANK_UNBLANK:
+		shadow_protect_win(win, 1);
 		writel(0x0, sfb->regs + sfb->variant.winmap + (index * 4));
+		shadow_protect_win(win, 0);
 		wincon |= WINCONx_ENWIN;
 		sfb->enabled |= (1 << index);
 		break;
@@ -817,7 +824,9 @@ static int s3c_fb_blank(int blank_mode, struct fb_info *info)
 		return 1;
 	}
 
+	shadow_protect_win(win, 1);
 	writel(wincon, sfb->regs + sfb->variant.wincon + (index * 4));
+	shadow_protect_win(win, 0);
 
 	/* Check the enabled state to see if we need to be running the
 	 * main LCD interface, as if there are no active windows then
@@ -836,8 +845,11 @@ static int s3c_fb_blank(int blank_mode, struct fb_info *info)
 	/* we're stuck with this until we can do something about overriding
 	 * the power control using the blanking event for a single fb.
 	 */
-	if (index == sfb->pdata->default_win)
+	if (index == sfb->pdata->default_win) {
+		shadow_protect_win(win, 1);
 		s3c_fb_enable(sfb, blank_mode != FB_BLANK_POWERDOWN ? 1 : 0);
+		shadow_protect_win(win, 0);
+	}
 
 	return 0;
 }
@@ -1534,10 +1546,15 @@ static int s3c_fb_resume(struct device *dev)
 
 	for (win_no = 0; win_no < sfb->variant.nr_windows - 1; win_no++) {
 		void __iomem *regs = sfb->regs + sfb->variant.keycon;
+		win = sfb->windows[win_no];
+		if (!win)
+			continue;
 
+		shadow_protect_win(win, 1);
 		regs += (win_no * 8);
 		writel(0xffffff, regs + WKEYCON0);
 		writel(0xffffff, regs + WKEYCON1);
+		shadow_protect_win(win, 0);
 	}
 
 	/* restore framebuffers */
