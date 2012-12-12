@@ -1,6 +1,10 @@
 VERSION = 3
 PATCHLEVEL = 0
+<<<<<<< HEAD
 SUBLEVEL = 54
+=======
+SUBLEVEL = 56
+>>>>>>> jb+
 EXTRAVERSION =
 NAME = Sneaky Weasel
 
